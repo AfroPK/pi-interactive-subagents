@@ -1,0 +1,3 @@
+# Agent frontmatter parser matches LF only; keep LF on Windows checkouts (core.autocrlf=true).
+* text=auto eol=lf
+*.png binary

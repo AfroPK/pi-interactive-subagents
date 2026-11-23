@@ -104,6 +104,17 @@ function rebalanceSurfaces(hintPane?: string): void {
   }, 120);
 }
 
+function listPaneIds(): Set<string> {
+  try {
+    const out = execFileSync("tmux", ["list-panes", "-a", "-F", "#{pane_id}"], {
+      encoding: "utf8",
+    });
+    return new Set(out.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.startsWith("%")));
+  } catch {
+    return new Set();
+  }
+}
+
 // ── Surface primitives ──
 
 /**
@@ -144,9 +155,20 @@ export function createSurfaceSplit(
   }
   args.push("-P", "-F", "#{pane_id}");
 
+  // psmux (Windows tmux) does not fail when there is no room to split: it exits 0
+  // and prints an EXISTING pane id (the target). Using that id would type the
+  // subagent command into, and later kill, the parent pi pane. Only accept a
+  // pane id that did not exist before the split.
+  const before = listPaneIds();
   const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
   if (!pane.startsWith("%")) {
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
+  }
+  if (before.has(pane) || pane === fromSurface) {
+    throw new Error(
+      `tmux could not create a new pane (no space left to split; got existing pane ${pane}). ` +
+        "Close some subagent panes or enlarge the terminal window.",
+    );
   }
 
   rebalanceSurfaces(pane);
