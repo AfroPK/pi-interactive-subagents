@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
@@ -1209,10 +1209,12 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+    // Normalise Windows separators (path.sep) before comparing suffixes.
+    const norm = (p?: string) => p?.split(sep).join("/");
+    assert.ok(norm(testApi.getToolExtensionPath("web_search"))?.endsWith("web-search/index.ts"));
+    assert.ok(norm(testApi.getToolExtensionPath("safe_bash"))?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    assert.ok(norm(testApi.getToolExtensionPath("subagent"))?.endsWith("index.ts"));
   });
 
   it("ignores invalid session-mode values", async () => {

@@ -2346,7 +2346,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       // While the parent is mid-turn Pi rejects a bare sendUserMessage; steer it in instead.
-      if (ctx.isIdle()) pi.sendUserMessage(toolCall);
+      if (typeof ctx.isIdle !== "function" || ctx.isIdle()) pi.sendUserMessage(toolCall);
       else pi.sendUserMessage(toolCall, { deliverAs: "steer" });
     },
   });

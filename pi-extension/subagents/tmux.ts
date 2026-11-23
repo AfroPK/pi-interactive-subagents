@@ -13,7 +13,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
@@ -220,8 +220,78 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  sendCommand(surface, bashLaunchCommand(surface, scriptPath));
   return scriptPath;
+}
+
+// ── Windows: run launcher scripts with Git Bash ──
+//
+// On Windows the pane shell is usually PowerShell, where a bare `bash` resolves to
+// C:\Windows\System32\bash.exe (WSL). WSL bash strips the backslashes from the
+// Windows script path ("C:UsersFreddy...sh: No such file"), the subagent never
+// starts and its pane is left open. So resolve Git Bash explicitly.
+
+let cachedWindowsBash: string | null | undefined;
+
+function isWslBash(p: string): boolean {
+  return /[\\/](system32|windowsapps)[\\/]bash\.exe$/i.test(p);
+}
+
+/** Locate Git Bash (not WSL) on Windows. Override with PI_SUBAGENT_BASH. */
+export function findWindowsBash(): string | null {
+  if (cachedWindowsBash !== undefined) return cachedWindowsBash;
+  const candidates: string[] = [];
+  if (process.env.PI_SUBAGENT_BASH) candidates.push(process.env.PI_SUBAGENT_BASH);
+  // Pi's own shellPath setting is the bash the user already runs Pi's tools with.
+  try {
+    const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8"));
+    if (typeof settings.shellPath === "string") candidates.push(settings.shellPath);
+  } catch {}
+  for (const base of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs")]) {
+    if (base) candidates.push(join(base, "Git", "bin", "bash.exe"));
+  }
+  candidates.push(join(homedir(), "scoop", "apps", "git", "current", "bin", "bash.exe"));
+  try {
+    // <git>\cmd\git.exe -> <git>\bin\bash.exe
+    const git = execFileSync("where.exe", ["git"], { encoding: "utf8" }).split(/\r?\n/)[0]?.trim();
+    if (git) candidates.push(join(dirname(dirname(git)), "bin", "bash.exe"));
+  } catch {}
+  cachedWindowsBash = null;
+  for (const raw of candidates) {
+    const p = raw.replace(/[\\/]+/g, "/");
+    if (!isWslBash(p) && existsSync(p)) {
+      cachedWindowsBash = p;
+      break;
+    }
+  }
+  return cachedWindowsBash;
+}
+
+/** The command typed into a pane to run a launcher script, in that pane shell's syntax. */
+export function bashLaunchCommand(surface: string, scriptPath: string): string {
+  if (process.platform !== "win32") return `bash ${shellEscape(scriptPath)}`;
+  const bash = findWindowsBash();
+  if (!bash) {
+    throw new Error(
+      "Git Bash not found (plain `bash` on Windows is WSL, which cannot run the subagent launcher). " +
+        "Install Git for Windows or set PI_SUBAGENT_BASH to Git's bin\\bash.exe.",
+    );
+  }
+  const script = scriptPath.replace(/\\/g, "/");
+  let shell = "";
+  try {
+    shell = execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{pane_current_command}"], {
+      encoding: "utf8",
+    }).trim().toLowerCase();
+  } catch {}
+  const name = shell.replace(/\.exe$/, "");
+  if (name === "cmd") return `"${bash}" "${script}"`;
+  if (["bash", "sh", "zsh", "dash", "fish"].includes(name)) {
+    return `${shellEscape(bash)} ${shellEscape(script)}`;
+  }
+  // PowerShell (psmux's default) and unknown shells: call operator + single quotes.
+  return `& ${shellEscape(bash)} ${shellEscape(script)}`;
 }
 
 /**
