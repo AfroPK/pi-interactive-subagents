@@ -183,7 +183,9 @@ for (const backend of backends) {
       const marker = uniqueId();
       const filePath = `/tmp/pi-tmux-test-${marker}.txt`;
 
-      sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
+      // cmd's echo writes ASCII; PowerShell 5.1's `>` would write UTF-16, which
+      // the readFileSync("utf8") assertion below cannot match.
+      sendCommand(surface, `cmd /c "echo FILE_${marker}> ${filePath}"; echo "WRITTEN_${marker}"`);
 
       await waitForScreen(surface, new RegExp(`WRITTEN_${marker}`), 10_000, 50);
       const content = await waitForFile(filePath, 10_000, new RegExp(`FILE_${marker}`));
@@ -231,6 +233,29 @@ for (const backend of backends) {
       closeSurface(surface);
       await sleep(1500);
       assert.equal(count(), "0", "closing the pane must not leave the ping orphaned");
+    });
+
+    it("closing a pane also kills processes orphaned BEFORE the close (Windows jobs)", async (t) => {
+      if (process.platform !== "win32") return t.skip("job objects are Windows-only");
+      const { execFileSync } = await import("node:child_process");
+      const surface = createTrackedSurface(env, "orphan-test");
+      await sleep(1500);
+      const marker = 500 + Math.floor(Math.random() * 400);
+      // bash spawns ping; killing bash afterwards leaves ping with a dead parent.
+      sendCommand(surface, `& 'C:/Program Files/Git/bin/bash.exe' -c 'ping -n ${marker} 127.0.0.1'`);
+      await sleep(3000);
+      const count = () =>
+        execFileSync("powershell", ["-NoProfile", "-Command",
+          `@(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match '-n ${marker} ' }).Count`],
+          { encoding: "utf8" }).trim();
+      assert.equal(count(), "1", "ping should be running inside the pane");
+      execFileSync("powershell", ["-NoProfile", "-Command",
+        `Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'bash.exe' -and $_.CommandLine -match '-n ${marker} ' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`]);
+      await sleep(500);
+      assert.equal(count(), "1", "ping is now orphaned (parent dead) but still running");
+      closeSurface(surface);
+      await sleep(1500);
+      assert.equal(count(), "0", "the job kill must end even the already-orphaned ping");
     });
   });
 }

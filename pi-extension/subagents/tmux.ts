@@ -11,6 +11,7 @@
  * the user's focus.
  */
 import { execFile, execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -187,6 +188,8 @@ export function createSurfaceSplit(
     );
   }
 
+  // Before any command is typed into the pane, so every child joins the job.
+  assignSurfaceJob(pane);
   rebalanceSurfaces(pane);
   return pane;
 }
@@ -340,11 +343,102 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 /**
  * Close a pane.
  */
+// ── Windows: per-pane Job Objects ──
+//
+// Windows does not end child processes with their parent, and parent/child
+// links break as soon as an intermediate process exits — so killing a pane's
+// process TREE misses tool processes that were already orphaned (a bash tool
+// that timed out, a shell that exited). A Job Object tracks MEMBERSHIP
+// instead: the pane's shell is assigned at creation, every process it ever
+// spawns joins automatically, and terminating the job ends all members even
+// after the original shell is gone. Handles are held by this (long-lived) pi
+// process, because a job with no handles and no members is destroyed.
+// No KILL_ON_JOB_CLOSE: pi exiting must not take running subagents down.
+
+interface WinJobApi {
+  create(): any;
+  assign(job: any, pid: number): boolean;
+  terminate(job: any): void;
+  close(job: any): void;
+}
+
+let winJobApi: WinJobApi | null | undefined;
+const surfaceJobs = new Map<string, any>();
+
+function getWinJobApi(): WinJobApi | null {
+  if (process.platform !== "win32") return null;
+  if (winJobApi !== undefined) return winJobApi;
+  try {
+    const koffi = createRequire(import.meta.url)("koffi");
+    const k32 = koffi.load("kernel32.dll");
+    const CreateJobObjectW = k32.func("CreateJobObjectW", "void*", ["void*", "void*"]);
+    const OpenProcess = k32.func("OpenProcess", "void*", ["uint", "bool", "uint"]);
+    const AssignProcessToJobObject = k32.func("AssignProcessToJobObject", "bool", ["void*", "void*"]);
+    const TerminateJobObject = k32.func("TerminateJobObject", "bool", ["void*", "uint"]);
+    const CloseHandle = k32.func("CloseHandle", "bool", ["void*"]);
+    winJobApi = {
+      create: () => CreateJobObjectW(null, null),
+      assign(job, pid) {
+        // PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        const proc = OpenProcess(0x0100 | 0x0001, false, pid);
+        if (!proc) return false;
+        try {
+          return AssignProcessToJobObject(job, proc);
+        } finally {
+          CloseHandle(proc);
+        }
+      },
+      terminate: (job) => TerminateJobObject(job, 1),
+      close: (job) => CloseHandle(job),
+    };
+  } catch {
+    winJobApi = null; // koffi unavailable: fall back to taskkill /T
+  }
+  return winJobApi;
+}
+
+/** Put the new pane's shell (and therefore everything it spawns) into a job. */
+function assignSurfaceJob(surface: string): void {
+  const api = getWinJobApi();
+  if (!api) return;
+  try {
+    const pid = Number(
+      execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{pane_pid}"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim(),
+    );
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return;
+    const job = api.create();
+    if (!job) return;
+    if (api.assign(job, pid)) surfaceJobs.set(surface, job);
+    else api.close(job); // already in a restrictive job: taskkill fallback at close
+  } catch {}
+}
+
+/** Terminate every process the pane ever spawned, orphans included. */
+function terminateSurfaceJob(surface: string): boolean {
+  const job = surfaceJobs.get(surface);
+  if (!job) return false;
+  surfaceJobs.delete(surface);
+  const api = getWinJobApi();
+  try {
+    api?.terminate(job);
+  } catch {}
+  try {
+    api?.close(job);
+  } catch {}
+  return true;
+}
+
 export function closeSurface(surface: string): void {
   requireTmux();
+  // Job termination comes FIRST and also runs when the pane is already gone:
+  // orphaned members outlive both the pane and its shell.
+  const hadJob = terminateSurfaceJob(surface);
   // A pane that is already gone (closed by the user or the orchestrator) is fine.
   if (!surfaceExists(surface)) return;
-  killPaneProcessTree(surface);
+  if (!hadJob) killPaneProcessTree(surface);
   try {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (e) {
