@@ -344,8 +344,38 @@ export function closeSurface(surface: string): void {
   requireTmux();
   // A pane that is already gone (closed by the user or the orchestrator) is fine.
   if (!surfaceExists(surface)) return;
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  killPaneProcessTree(surface);
+  try {
+    execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    // Ending the shell's process tree usually closes the pane by itself.
+    if (surfaceExists(surface)) throw e;
+  }
   rebalanceSurfaces();
+}
+
+/**
+ * Windows only: kill every process under the pane's shell first. psmux's
+ * kill-pane ends just the shell, and Windows does not take children down with
+ * their parent, so a stopped subagent's running tool (sleep, a build, a dev
+ * server) would otherwise keep running orphaned. POSIX tmux sends SIGHUP to
+ * the pane's process group, so nothing extra is needed there.
+ */
+function killPaneProcessTree(surface: string): void {
+  if (process.platform !== "win32") return;
+  if (surface === process.env.TMUX_PANE) return; // never the parent pi's own pane
+  try {
+    const pid = execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{pane_pid}"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    // Never kill ourselves: the parent pi's pane would only match if psmux
+    // resolved the target wrongly.
+    if (!/^\d+$/.test(pid) || Number(pid) === process.pid || Number(pid) === process.ppid) return;
+    execFileSync("taskkill", ["/PID", pid, "/T", "/F"], { stdio: "ignore", windowsHide: true });
+  } catch {
+    // Best effort: kill-pane below still closes the pane.
+  }
 }
 
 // ── Exit polling ──

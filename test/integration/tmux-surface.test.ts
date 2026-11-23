@@ -214,5 +214,23 @@ for (const backend of backends) {
       // Closing an already-gone pane must not throw (the watcher's cleanup does this).
       assert.doesNotThrow(() => closeSurface(surface));
     });
+
+    it("closing a subagent pane also ends the processes started inside it (Windows)", async (t) => {
+      if (process.platform !== "win32") return t.skip("POSIX tmux HUPs the pane's process group");
+      const { execFileSync } = await import("node:child_process");
+      const surface = createTrackedSurface(env, "tree-test");
+      await sleep(1500);
+      const marker = 400 + Math.floor(Math.random() * 500); // unique ping count to find our process
+      sendCommand(surface, `ping.exe -n ${marker} 127.0.0.1`);
+      await sleep(2000);
+      const count = () =>
+        execFileSync("powershell", ["-NoProfile", "-Command",
+          `@(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match '-n ${marker} ' }).Count`],
+          { encoding: "utf8" }).trim();
+      assert.equal(count(), "1", "ping should be running inside the pane");
+      closeSurface(surface);
+      await sleep(1500);
+      assert.equal(count(), "0", "closing the pane must not leave the ping orphaned");
+    });
   });
 }
