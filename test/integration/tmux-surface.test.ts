@@ -11,6 +11,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
+import { pollForExit, surfaceExists } from "../../pi-extension/subagents/tmux.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -192,6 +193,26 @@ for (const backend of backends) {
       try {
         unlinkSync(filePath);
       } catch {}
+    });
+
+    it("ends the watch when a subagent pane is killed before it finishes", async () => {
+      const surface = createTrackedSurface(env, "killed-test");
+      await sleep(1000);
+      assert.equal(surfaceExists(surface), true);
+      const watch = pollForExit(surface, new AbortController().signal, { interval: 200 });
+      await sleep(600);
+      closeSurface(surface);
+      const result = await Promise.race([
+        watch,
+        sleep(10_000).then(() => {
+          throw new Error("pollForExit kept polling a pane that no longer exists");
+        }),
+      ]);
+      assert.equal(result.paneClosed, true);
+      assert.equal(result.reason, "error");
+      assert.equal(surfaceExists(surface), false);
+      // Closing an already-gone pane must not throw (the watcher's cleanup does this).
+      assert.doesNotThrow(() => closeSurface(surface));
     });
   });
 }

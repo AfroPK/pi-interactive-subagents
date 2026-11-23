@@ -104,15 +104,31 @@ function rebalanceSurfaces(hintPane?: string): void {
   }, 120);
 }
 
-function listPaneIds(): Set<string> {
+/**
+ * Pane ids in the session that contains `anchor` (default: the parent pi pane).
+ * Scoped to one session on purpose: psmux numbers panes per session, so `%1`
+ * exists in every session and `list-panes -a` cannot identify a pane.
+ * Returns null when tmux cannot answer.
+ */
+function listSessionPaneIds(anchor?: string): Set<string> | null {
+  const target = anchor ?? process.env.TMUX_PANE;
   try {
-    const out = execFileSync("tmux", ["list-panes", "-a", "-F", "#{pane_id}"], {
-      encoding: "utf8",
-    });
+    const args = ["list-panes", "-s", ...(target ? ["-t", target] : []), "-F", "#{pane_id}"];
+    const out = execFileSync("tmux", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     return new Set(out.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.startsWith("%")));
   } catch {
-    return new Set();
+    return null;
   }
+}
+
+/**
+ * False only when tmux positively reports the pane is gone from the parent's
+ * session. Any uncertainty (tmux not answering) counts as alive, so a hiccup
+ * can never end a running subagent.
+ */
+export function surfaceExists(surface: string): boolean {
+  const ids = listSessionPaneIds();
+  return ids === null || ids.has(surface);
 }
 
 // ── Surface primitives ──
@@ -159,7 +175,7 @@ export function createSurfaceSplit(
   // and prints an EXISTING pane id (the target). Using that id would type the
   // subagent command into, and later kill, the parent pi pane. Only accept a
   // pane id that did not exist before the split.
-  const before = listPaneIds();
+  const before = listSessionPaneIds(fromSurface) ?? new Set<string>();
   const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
   if (!pane.startsWith("%")) {
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
@@ -326,6 +342,8 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
+  // A pane that is already gone (closed by the user or the orchestrator) is fine.
+  if (!surfaceExists(surface)) return;
   execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
   rebalanceSurfaces();
 }
@@ -335,6 +353,8 @@ export function closeSurface(surface: string): void {
 export interface PollResult {
   /** How the subagent exited */
   reason: "done" | "sentinel" | "error";
+  /** True when the pane disappeared before the subagent signalled completion. */
+  paneClosed?: boolean;
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
@@ -379,6 +399,9 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  // Consecutive polls that found the pane missing; two in a row avoids acting
+  // on a single transient tmux failure.
+  let missingPolls = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -425,6 +448,23 @@ export async function pollForExit(
           }
         } catch {}
       }
+    }
+
+    // Pane killed (by the user, the orchestrator, or a crash) before the
+    // subagent printed its done sentinel: nothing will ever arrive, so end the
+    // watch instead of polling forever and leaving a ghost in the widget.
+    if (!surfaceExists(surface)) {
+      missingPolls++;
+      if (missingPolls >= 2) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage: "Subagent pane was closed before the subagent finished.",
+          paneClosed: true,
+        };
+      }
+    } else {
+      missingPolls = 0;
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
