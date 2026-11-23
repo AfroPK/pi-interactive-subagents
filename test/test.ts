@@ -1275,6 +1275,18 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("preserves absolute cwd paths on every platform", () => {
+    const absoluteCwd = process.cwd();
+    const result = testApi.resolveSubagentPaths({ name: "A", task: "T", cwd: absoluteCwd }, null);
+    assert.equal(result.effectiveCwd, absoluteCwd);
+    assert.equal(result.localAgentDir, join(absoluteCwd, ".pi", "agent"));
+  });
+
+  it("still resolves relative cwd paths against the spawner cwd", () => {
+    const result = testApi.resolveSubagentPaths({ name: "A", task: "T", cwd: "agents/scout" }, null);
+    assert.equal(result.effectiveCwd, join(process.cwd(), "agents/scout"));
+  });
+
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
