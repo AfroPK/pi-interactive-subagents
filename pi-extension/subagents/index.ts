@@ -1599,7 +1599,8 @@ async function watchSubagent(
       // The last assistant message is from an interrupted run, not a final answer.
       const last = existsSync(sessionFile) ? findLastAssistantMessage(getNewEntries(sessionFile, 0)) : null;
       summary =
-        "Stopped: the subagent's pane was closed before it finished, so it has no final result." +
+        "Stopped: the subagent's pane was closed before it finished, so it has no final result. " +
+        "The pane was closed deliberately (by the user or by you) or it crashed: do not resume or respawn it unless the user asks." +
         (last ? `\n\nLast message before it stopped:\n${last}` : "");
     }
 
