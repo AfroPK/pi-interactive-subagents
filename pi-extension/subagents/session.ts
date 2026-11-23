@@ -158,6 +158,19 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /**
+   * Set when the subagent's pane was closed before it finished (stopped by the
+   * user, the orchestrator, or a crash). Resuming it then needs userRequested.
+   */
+  stoppedByPaneClose?: boolean;
+}
+
+/** Set or clear the stoppedByPaneClose mark on an existing registry entry. */
+export function setNameStopped(artifactDir: string, name: string, stopped: boolean): void {
+  const entry = readNameRegistry(artifactDir)[name];
+  if (!entry || typeof entry.sessionFile !== "string") return;
+  const { stoppedByPaneClose: _drop, ...rest } = entry;
+  registerName(artifactDir, name, stopped ? { ...rest, stoppedByPaneClose: true } : rest);
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

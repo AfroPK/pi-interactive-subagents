@@ -34,6 +34,7 @@ import {
   readNameRegistry,
   readSubagentLoadout,
   registerName,
+  setNameStopped,
   resolveNameInRegistry,
   seedSubagentSessionFile,
   summarizeSessionStats,
@@ -159,6 +160,7 @@ const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
   "subagents_list",
+  "subagent_stop",
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
@@ -592,6 +594,8 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** The pane was closed before the subagent finished (user/orchestrator stop or crash). */
+  paneClosed?: boolean;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -616,6 +620,8 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** Set by subagent_stop: the caller stopped it on purpose and was already told. */
+  stopRequested?: boolean;
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -1620,6 +1626,7 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
+      ...(result.paneClosed ? { paneClosed: true } : {}),
     };
   } catch (err: any) {
     try {
@@ -1836,6 +1843,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            if (running.stopRequested) return; // subagent_stop already returned the outcome
+            if (result.paneClosed) setNameStopped(parentArtifactDir, running.name, true);
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -2013,6 +2022,82 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+  // ── subagent_stop tool ──
+  pi.registerTool({
+      name: "subagent_stop",
+      label: "Stop Subagent",
+      description:
+        "Stop a running subagent by name and close its pane. Use it when a subagent is off track, stuck, redundant, " +
+        "or its work is no longer needed. Returns its last progress message immediately; no further result arrives for it. " +
+        "The session is kept: continue it later with subagent_message({ name, message }). " +
+        "Always use this instead of killing panes or processes with bash (that leaves the subagent untracked).",
+      promptSnippet:
+        "Stop a running subagent by name (closes its pane, returns its last progress). " +
+        "Resume later with subagent_message. Never kill subagent panes with bash.",
+      parameters: Type.Object({
+        name: Type.String({ description: "Exact display name of the running subagent to stop." }),
+      }),
+
+      async execute(_toolCallId, params) {
+        const target = Array.from(runningSubagents.values()).find((r) => r.name === params.name);
+        if (!target) {
+          const names = Array.from(runningSubagents.values()).map((r) => r.name);
+          const text =
+            `No running subagent named "${params.name}". ` +
+            (names.length ? `Running: ${names.join(", ")}.` : "No subagents are running.");
+          return { content: [{ type: "text" as const, text }], details: { error: text } };
+        }
+
+        target.stopRequested = true;
+        let last: string | null = null;
+        if (target.cli !== "claude" && existsSync(target.sessionFile)) {
+          try {
+            last = findLastAssistantMessage(getNewEntries(target.sessionFile, 0));
+          } catch {}
+        }
+        try {
+          closeSurface(target.surface);
+        } catch {}
+        // Watcher notices the closed pane within ~2 s and removes the entry;
+        // drop it now so the widget and name checks are immediately accurate.
+        target.abortController?.abort();
+        runningSubagents.delete(target.id);
+        updateWidget();
+
+        const elapsed = Math.floor((Date.now() - target.startTime) / 1000);
+        const text =
+          `Stopped subagent "${target.name}" after ${elapsed}s. Its session is kept; resume it with ` +
+          `subagent_message({ name: "${target.name}", message }).` +
+          (last ? `\n\nLast progress message:\n${last}` : "\n\nIt had not produced a message yet.");
+        return {
+          content: [{ type: "text" as const, text }],
+          details: { status: "stopped", name: target.name, elapsed },
+        };
+      },
+
+      renderCall(args, theme) {
+        return new Text(
+          "■ " + theme.fg("toolTitle", theme.bold(args.name ?? "(unknown)")) + theme.fg("dim", " — stop"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.status === "stopped") {
+          return new Text(
+            theme.fg("warning", "■") + " " + theme.fg("toolTitle", theme.bold(details.name)) +
+              theme.fg("dim", ` — stopped after ${details.elapsed}s`),
+            0,
+            0,
+          );
+        }
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("error", text), 0, 0);
+      },
+    });
+
   // ── subagent_message tool ──
   pi.registerTool({
       name: "subagent_message",
@@ -2039,6 +2124,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           description:
             "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
         }),
+        userRequested: Type.Optional(
+          Type.Boolean({
+            description:
+              "Set true ONLY when the user explicitly asked to resume this subagent. Required to resume a subagent whose pane was closed (stopped on purpose or crashed).",
+          }),
+        ),
       }),
 
       renderCall(args, theme) {
@@ -2120,6 +2211,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               : "No subagents have been spawned in this session yet.");
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
+
+        // A subagent whose pane was closed was stopped on purpose (or crashed):
+        // only resume it when the user asked for that, never on the agent's own initiative.
+        if (entry.stoppedByPaneClose && !params.userRequested) {
+          const err =
+            `Subagent "${requestedName}" was stopped: its pane was closed before it finished. ` +
+            "It is not resumed automatically. Ask the user whether to resume it; only if they say yes, " +
+            "call subagent_message again with userRequested: true.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        if (entry.stoppedByPaneClose) setNameStopped(parentArtifactDir, requestedName, false);
 
         const sessionPath = entry.sessionFile;
         if (!sessionPath || !existsSync(sessionPath)) {
@@ -2270,9 +2372,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+            if (running.stopRequested) return; // subagent_stop already returned the outcome
+            if (result.paneClosed) setNameStopped(parentArtifactDir, name, true);
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
+            const summary = result.paneClosed ? result.summary : findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
                 : result.exitCode !== 0

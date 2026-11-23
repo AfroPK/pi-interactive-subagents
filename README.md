@@ -32,6 +32,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
+| `subagent_stop` | Stop a running sub-agent by name: closes its pane, returns its last progress at once, keeps the session for `subagent_message` |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
@@ -65,6 +66,12 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
 **Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+
+### Stopping and closed panes
+
+Use `subagent_stop({ name })` to stop a sub-agent on purpose. It closes the pane, returns the last progress message immediately, and the session can be continued later with `subagent_message`.
+
+If a pane is closed any other way (by hand, or a crash), the watcher notices within about two seconds, removes the widget entry, and reports "Stopped: the subagent's pane was closed". That name is then marked stopped: `subagent_message` refuses to resume it unless the call passes `userRequested: true`, which the orchestrator should only do when the user asked.
 
 ### ask_question
 
@@ -109,7 +116,7 @@ You are a specialized agent that does X...
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
-| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
+| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`, `subagent_stop`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |

@@ -15,6 +15,7 @@ import {
   readNameRegistry,
   readSubagentLoadout,
   registerName,
+  setNameStopped,
   resolveNameInRegistry,
   nameRegistryPath,
   writeSubagentLoadout,
@@ -1909,8 +1910,8 @@ describe("tool registration", () => {
     const props = messageTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["message", "name"],
-      "only name/message should remain (sessionId dropped)",
+      ["message", "name", "userRequested"],
+      "name/message plus the optional userRequested resume override (sessionId dropped)",
     );
     assert.equal(props.message.type, "string");
     assert.equal(props.name.type, "string");
@@ -1921,6 +1922,49 @@ describe("tool registration", () => {
     );
     assert.equal(props.sessionId, undefined, "sessionId should be removed");
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
+  });
+
+  it("refuses to resume a pane-closed subagent unless the user asked", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+    const sessionDir = mkdtempSync(join(tmpdir(), "pi-stop-"));
+    // The resume path needs a multiplexer; pretend we are inside tmux (the block
+    // returns before anything touches a pane).
+    const prevTmux = process.env.TMUX;
+    process.env.TMUX = prevTmux ?? "/tmp/fake-tmux,1,0";
+    try {
+      const artifactDir = join(sessionDir, "artifacts", "parent-1");
+      const childSession = join(sessionDir, "child.jsonl");
+      writeFileSync(childSession, "");
+      registerName(artifactDir, "worker", { sessionFile: childSession, sessionId: null });
+      setNameStopped(artifactDir, "worker", true);
+      assert.equal(readNameRegistry(artifactDir).worker.stoppedByPaneClose, true);
+
+      const ctx = { sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => "parent-1" } };
+      const refused = await messageTool.execute("t1", { name: "worker", message: "continue" }, undefined, undefined, ctx);
+      assert.match(refused.content[0].text, /was stopped: its pane was closed/);
+      assert.match(refused.content[0].text, /userRequested: true/);
+      assert.equal(readNameRegistry(artifactDir).worker.stoppedByPaneClose, true, "a refused call keeps the mark");
+
+      setNameStopped(artifactDir, "worker", false);
+      assert.equal(readNameRegistry(artifactDir).worker.stoppedByPaneClose, undefined, "clearing removes the mark");
+    } finally {
+      if (prevTmux === undefined) delete process.env.TMUX;
+      else process.env.TMUX = prevTmux;
+      rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
+  it("registers subagent_stop and reports unknown names without throwing", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const stopTool = registeredTools.find((tool) => tool.name === "subagent_stop");
+    assert.ok(stopTool, "expected subagent_stop tool to be registered");
+    assert.deepEqual(stopTool.parameters.required, ["name"]);
+    assert.match(stopTool.description, /instead of killing panes/);
+    const res = await stopTool.execute("t2", { name: "nobody" });
+    assert.match(res.content[0].text, /No running subagent named "nobody"/);
   });
 
   it("no longer registers subagent_interrupt or subagent_resume", () => {
